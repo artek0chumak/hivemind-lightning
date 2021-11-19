@@ -3,7 +3,7 @@ Repo contains WIP code to try get hivemind to work with Lightning & minGPT.
 ## Usage
 
 ```
-pip install uvicorn pytorch-lightning
+pip install uvicorn pytorch-lightning fastapi
 ```
 
 We use a coordinator server to generate a peer list to send to everyone else (might be removed later).

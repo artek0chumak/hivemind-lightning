@@ -19,12 +19,6 @@ def get_args_parser() -> ArgumentParser:
         help="Number of local clients to run on the local machine.",
     )
     parser.add_argument(
-        "--server_address",
-        type=str,
-        default="[::]:8080",
-        help="The address of the host server. Default is localhost.",
-    )
-    parser.add_argument(
         "--coordinator_address",
         type=str,
         default="127.0.0.1:8000",
