@@ -275,26 +275,37 @@ class CharDataModule(pl.LightningDataModule):
 
 
 class HiveMindCallback(Callback):
-    def __init__(self, hm_target_group_size: int, dht: hivemind.DHT):
+    def __init__(self, target_batch_size: int, batch_size: int, dht: hivemind.DHT):
         super().__init__()
         self.dht = dht
-        self.target_group_size = hm_target_group_size
+        self.target_batch_size = target_batch_size
+        self.batch_size = batch_size
+
+    @property
+    def averager_kwargs(self):
+        return dict(
+            min_matchmaking_time=5.0,
+            averaging_timeout=60.0,
+            min_refresh_period=0.5,
+            max_refresh_period=30,
+            default_refresh_period=3
+        )
 
     def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if len(trainer.optimizers) > 1:
             raise MisconfigurationException("Hivemind only supports training with one optimizer.")
         (optimizer,) = trainer.optimizers
         # Set up a decentralized optimizer that will average with peers in background
-        opt = hivemind.optim.DecentralizedOptimizer(
+        opt = hivemind.optim.CollaborativeOptimizer(
             opt=optimizer,
             dht=self.dht,
             prefix="lightning_run",
             compression=hivemind.Float16Compression(),
-            average_parameters=True,
-            average_gradients=False,
-            client_mode=False,
             verbose=True,
-            target_group_size=self.target_group_size
+            target_batch_size=self.target_batch_size,
+            batch_size_per_step=self.batch_size,
+            start=True,
+            **self.averager_kwargs
         )
         # opt.averager.load_state_from_peers()
         trainer.optimizers = [WrapperOptimizer(opt)]
@@ -317,8 +328,6 @@ class WrapperOptimizer:
 
 
 if __name__ == "__main__":
-    target_size = 8  # todo: probably expose this eventually
-
     parser = ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
     parser.add_argument("--n_layer", default=8, type=int)
@@ -347,7 +356,7 @@ if __name__ == "__main__":
     )
 
     lr_decay = LearningRateDecayCallback(
-        learning_rate=6e-4 * target_size,
+        learning_rate=6e-4,
         warmup_tokens=512 * 20,
         final_tokens=2 * len(dm.train_dataset) * args.block_size,
     )
@@ -375,7 +384,7 @@ if __name__ == "__main__":
         precision=16,
         gradient_clip_val=1,
         callbacks=[
-            HiveMindCallback(hm_target_group_size=target_size, dht=dht),
+            HiveMindCallback(target_batch_size=4096, batch_size=args.batch_size, dht=dht),
             lr_decay,
             TimeCallback(),
         ],
