@@ -331,11 +331,11 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
     parser.add_argument("--n_layer", default=8, type=int)
-    parser.add_argument("--n_head", default=8, type=int)
-    parser.add_argument("--n_embd", default=512, type=int)
+    parser.add_argument("--n_head", default=16, type=int)
+    parser.add_argument("--n_embd", default=2048, type=int)
     parser.add_argument("--learning_rate", default=6e-4, type=float)
-    parser.add_argument("--block_size", default=128, type=int)
-    parser.add_argument("--batch_size", default=512, type=int)
+    parser.add_argument("--block_size", default=512, type=int)
+    parser.add_argument("--batch_size", default=8, type=int)
     parser.add_argument("--num_workers", default=0, type=int)
     args = parser.parse_args()
 
@@ -384,7 +384,7 @@ if __name__ == "__main__":
         precision=16,
         gradient_clip_val=1,
         callbacks=[
-            HiveMindCallback(target_batch_size=4096, batch_size=args.batch_size, dht=dht),
+            HiveMindCallback(target_batch_size=8192, batch_size=args.batch_size, dht=dht),
             lr_decay,
             TimeCallback(),
         ],
