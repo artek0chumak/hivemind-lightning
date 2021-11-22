@@ -1,0 +1,4 @@
+uvicorn
+pytorch-lightning
+fastapi
+git+https://github.com/learning-at-home/hivemind.git@optimizer_stable

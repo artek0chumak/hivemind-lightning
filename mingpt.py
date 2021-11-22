@@ -7,6 +7,7 @@ import math
 import os
 import time
 from argparse import ArgumentParser
+from functools import partial
 
 import hivemind
 import pytorch_lightning as pl
@@ -274,6 +275,44 @@ class CharDataModule(pl.LightningDataModule):
         return self.full_dataset.block_size
 
 
+class LightningOptimizer(hivemind.Optimizer):
+    """ A wrapper over hivemind.Optimizer that makes it compatible with Lightning """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def step(self, closure=None):
+        if closure:
+            closure()
+        return super().step()
+
+
+class DummyLearningRateScheduler(torch.optim.lr_scheduler.LambdaLR):
+    """
+    This is a dummy example that demonstrates how hivemind.Optimizer can use PyTorch LR Schedulers.
+    This scheduler is based not on local iterations, but on the number of global updates performed by all peers.
+
+    As an alternative, one can run a custom scheduler via Lightning callback based on LightningOptimizer.local_epoch.
+    """
+
+    def __init__(self, optimizer, num_warmup_steps, num_training_steps):
+        self.num_warmup_steps, self.num_training_steps = num_warmup_steps, num_training_steps
+        self._base_lr = self._prev_lr = optimizer.param_groups[0]['lr']
+        super().__init__(optimizer, self._linear_decay_with_warmup)
+
+    def _linear_decay_with_warmup(self, current_step: int):
+        if current_step < self.num_warmup_steps:
+            new_learning_rate = float(current_step) / float(max(1, self.num_warmup_steps))
+        else:
+            new_learning_rate = max(
+                0.0, float(self.num_training_steps - current_step
+                           ) / float(max(1, self.num_training_steps - self.num_warmup_steps))
+            )
+        if self.optimizer.param_groups[0]['lr'] != self._base_lr * new_learning_rate:
+            print(f"changing learning rate to {self._base_lr * new_learning_rate:.5f}")
+        return new_learning_rate
+
+
 class HiveMindCallback(Callback):
     def __init__(self, target_batch_size: int, batch_size: int, dht: hivemind.DHT):
         super().__init__()
@@ -282,13 +321,21 @@ class HiveMindCallback(Callback):
         self.batch_size = batch_size
 
     @property
-    def averager_kwargs(self):
+    def optimizer_kwargs(self):
         return dict(
-            min_matchmaking_time=5.0,
-            averaging_timeout=60.0,
-            min_refresh_period=0.5,
-            max_refresh_period=30,
-            default_refresh_period=3
+            matchmaking_time=5.0,
+            averaging_timeout=60.0,  # <-- this should be fine with default value
+            averager_opts=dict(
+                compression=hivemind.Float16Compression(),
+                min_matchmaking_time=1.0,
+                request_timeout=0.5
+            ),
+            tracker_opts=dict(
+                min_refresh_period=0.5,
+                max_refresh_period=10.0,
+                default_refresh_period=3.0,
+            ),  # ^-- these should be fine with all-default
+            verbose=True,
         )
 
     def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
@@ -296,46 +343,38 @@ class HiveMindCallback(Callback):
             raise MisconfigurationException("Hivemind only supports training with one optimizer.")
         (optimizer,) = trainer.optimizers
         # Set up a decentralized optimizer that will average with peers in background
-        opt = hivemind.optim.CollaborativeOptimizer(
-            opt=optimizer,
+        opt = LightningOptimizer(
             dht=self.dht,
             prefix="lightning_run",
-            compression=hivemind.Float16Compression(),
-            verbose=True,
+            params=optimizer.param_groups,
+            optimizer=type(optimizer),
+            scheduler=partial(DummyLearningRateScheduler, num_warmup_steps=500, num_training_steps=10_000),
             target_batch_size=self.target_batch_size,
             batch_size_per_step=self.batch_size,
-            start=True,
-            **self.averager_kwargs
+            **self.optimizer_kwargs
         )
-        # opt.averager.load_state_from_peers()
-        trainer.optimizers = [WrapperOptimizer(opt)]
+        opt.load_state_from_peers()
+        trainer.optimizers = [opt]
 
     def on_train_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         logging.getLogger("pytorch_lightning").info("Shutting down hivemind DHT.")
         self.dht.shutdown()
 
 
-class WrapperOptimizer:
-    def __init__(self, opt: hivemind.DecentralizedOptimizerBase):
-        self.__dict__ = {k: v for k, v in opt.__dict__.items() if k not in ("step",)}
-        self.__class__ = type("Lightning" + opt.__class__.__name__, (self.__class__, opt.__class__), {})
-        self.opt = opt
-
-    def step(self, closure=None):
-        if closure:
-            closure()
-        return self.opt.step()
-
-
 if __name__ == "__main__":
+    target_size = 8  # todo: probably expose this eventually
+    torch.set_num_threads(1)  # prevent peers from competing for cpu threads
+    # ^-- this is necessary only when running multiple hivemind peers on a single machine
+
     parser = ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
-    parser.add_argument("--n_layer", default=8, type=int)
+    parser.add_argument("--n_layer", default=12, type=int)
     parser.add_argument("--n_head", default=16, type=int)
-    parser.add_argument("--n_embd", default=2048, type=int)
-    parser.add_argument("--learning_rate", default=6e-4, type=float)
-    parser.add_argument("--block_size", default=512, type=int)
-    parser.add_argument("--batch_size", default=8, type=int)
+    parser.add_argument("--n_embd", default=1024, type=int)
+    parser.add_argument("--learning_rate", default=1e-3, type=float)
+    parser.add_argument("--block_size", default=2048, type=int)
+    parser.add_argument("--batch_size", default=1, type=int)
+    parser.add_argument("--target_batch_size", default=1024, type=int)
     parser.add_argument("--num_workers", default=0, type=int)
     args = parser.parse_args()
 
@@ -353,12 +392,6 @@ if __name__ == "__main__":
         n_head=args.n_head,
         n_embd=args.n_embd,
         learning_rate=args.learning_rate,
-    )
-
-    lr_decay = LearningRateDecayCallback(
-        learning_rate=6e-4,
-        warmup_tokens=512 * 20,
-        final_tokens=2 * len(dm.train_dataset) * args.block_size,
     )
 
 
@@ -384,8 +417,7 @@ if __name__ == "__main__":
         precision=16,
         gradient_clip_val=1,
         callbacks=[
-            HiveMindCallback(target_batch_size=8192, batch_size=args.batch_size, dht=dht),
-            lr_decay,
+            HiveMindCallback(target_batch_size=args.target_batch_size, batch_size=args.batch_size, dht=dht),
             TimeCallback(),
         ],
         val_check_interval=0.25,
