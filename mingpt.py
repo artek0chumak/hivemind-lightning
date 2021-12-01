@@ -220,7 +220,7 @@ class LearningRateDecayCallback(pl.Callback):
 
 class CharDataset(Dataset):
     def __init__(self, data, block_size):
-        chars = list(set(data))
+        chars = sorted(set(data))
         data_size, vocab_size = len(data), len(chars)
         rank_zero_info("data has %d characters, %d unique." % (data_size, vocab_size))
 
