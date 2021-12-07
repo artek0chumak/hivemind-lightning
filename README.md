@@ -9,7 +9,7 @@ pip install -r requirements.txt
 We use a coordinator server to generate a peer list to send to everyone else (might be removed later).
 
 ```bash
-uvicorn coordinator:app --reload
+python coordinator.py
 ```
 
 We have a CLI tool to spin up local processes for testing.

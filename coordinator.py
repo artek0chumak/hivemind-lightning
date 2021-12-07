@@ -1,6 +1,7 @@
 import ipaddress
 
 import hivemind
+import uvicorn
 from fastapi import FastAPI
 
 running_trainings = {}
@@ -22,3 +23,7 @@ async def get_dht(training_id: str):
     visible_peers = [str(a) for a in dht.get_visible_maddrs() if not ipaddress.ip_address(a.values()[0]).is_loopback]
     print("\n".join(visible_peers))
     return {"peers": visible_peers}
+
+
+if __name__ == "__main__":
+    uvicorn.run("coordinator:app", host="0.0.0.0", port=1339, log_level="debug")
