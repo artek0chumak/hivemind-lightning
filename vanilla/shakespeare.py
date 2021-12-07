@@ -1,23 +1,149 @@
-"""
-Minimal example to train an xFormer model using the Tiny Shakespeare dataset
-Reference: https://github.com/williamFalcon/minGPT & https://github.com/karpathy/minGPT.
-"""
-import logging
 import math
 import os
 import time
 from argparse import ArgumentParser
+from typing import List
 
-import hivemind
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from pytorch_lightning import Callback, Trainer
 from pytorch_lightning.utilities import rank_zero_info
-from pytorch_lightning.utilities.exceptions import MisconfigurationException
+from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics import Accuracy
+
+
+def lamb_step(
+        params: List[Tensor],
+        grads: List[Tensor],
+        exp_avgs: List[Tensor],
+        exp_avg_sqs: List[Tensor],
+        max_exp_avg_sqs: List[Tensor],
+        state_steps: List[int],
+        *,
+        beta1: float,
+        beta2: float,
+        lr: float,
+        weight_decay: float,
+        eps: float,
+):
+    r"""Functional API that performs AdamW algorithm computation.
+
+    See :class:`~torch.optim.AdamW` for details.
+    """
+    for i, param in enumerate(params):
+        grad = grads[i]
+        exp_avg = exp_avgs[i]
+        exp_avg_sq = exp_avg_sqs[i]
+        step = state_steps[i]
+
+        bias_correction1 = 1 - beta1 ** step
+        bias_correction2 = 1 - beta2 ** step
+
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+
+        ratio = exp_avg / denom / bias_correction1 + weight_decay * param
+
+        ratio_norm = ratio.norm().clamp(min=1e-9)  # configurable?
+        param_norm = param.norm()
+
+        step_size = lr * param_norm / ratio_norm
+
+        param.add_(ratio, alpha=-step_size)
+
+
+class LAMB(torch.optim.Optimizer):
+    r"""Implements LAMB algorithm. Based on PyTorch's Adam"""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        betas = float(betas[0]), float(betas[1])
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            max_exp_avg_sqs = []
+            state_steps = []
+            beta1, beta2 = group["betas"]
+
+            for p in group["params"]:
+                if p.grad is not None:
+                    params_with_grad.append(p)
+                    if p.grad.is_sparse:
+                        raise RuntimeError("LAMB does not support sparse gradients")
+                    grads.append(p.grad)
+
+                    state = self.state[p]
+                    # Lazy state initialization
+                    if len(state) == 0:
+                        state["step"] = 0
+                        # Exponential moving average of gradient values
+                        state["exp_avg"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
+                        # Exponential moving average of squared gradient values
+                        state["exp_avg_sq"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
+
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
+
+                    # update the steps for each param group update
+                    state["step"] += 1
+                    # record the step after step update
+                    state_steps.append(state["step"])
+
+            lamb_step(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+                beta1=beta1,
+                beta2=beta2,
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                eps=group["eps"],
+            )
+        return loss
 
 
 class CausalSelfAttention(nn.Module):
@@ -52,9 +178,15 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = (
+            self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
+        q = (
+            self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
+        v = (
+            self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -62,7 +194,9 @@ class CausalSelfAttention(nn.Module):
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_drop(self.proj(y))
@@ -126,31 +260,42 @@ class GPT(pl.LightningModule):
 
         self.block_size = self.config.block_size
         self.apply(self._init_weights)
-        self.blocks = nn.Sequential(*(Block(self.config) for _ in range(self.config.n_layer)))
+        self.blocks = nn.Sequential(
+            *(Block(self.config) for _ in range(self.config.n_layer))
+        )
         self.accuracy = Accuracy()
 
-        rank_zero_info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+        rank_zero_info(
+            "number of parameters: %e", sum(p.numel() for p in self.parameters())
+        )
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, GPT):
+            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
 
     def configure_optimizers(self):
         # create the optimizer
         no_decay = ["bias", "LayerNorm.weight"]
-        params_decay = [p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)]
-        params_nodecay = [p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)]
+        params_decay = [
+            p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)
+        ]
+        params_nodecay = [
+            p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)
+        ]
         optim_groups = [
             {"params": params_decay, "weight_decay": self.hparams.weight_decay},
             {"params": params_nodecay, "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas)
-        return optimizer
+        return LAMB(
+            optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas
+        )
 
     def forward(self, idx):
         b, t = idx.size()
@@ -158,7 +303,9 @@ class GPT(pl.LightningModule):
 
         # forward the GPT model
         token_embeddings = self.tok_emb(idx)  # each index maps to a (learnable) vector
-        position_embeddings = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
+        position_embeddings = self.pos_emb[
+                              :, :t, :
+                              ]  # each position maps to a (learnable) vector
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -184,11 +331,15 @@ class GPT(pl.LightningModule):
         self.log("valid_loss", loss)
 
         values, indices = torch.max(logits, dim=-1)
-        self.log("val_acc", self.accuracy(indices, targets), prog_bar=True, on_epoch=True)
+        self.log(
+            "val_acc", self.accuracy(indices, targets), prog_bar=True, on_epoch=True
+        )
 
 
 class LearningRateDecayCallback(pl.Callback):
-    def __init__(self, learning_rate, warmup_tokens=375e6, final_tokens=260e9, lr_decay=True):
+    def __init__(
+            self, learning_rate, warmup_tokens=375e6, final_tokens=260e9, lr_decay=True
+    ):
         super().__init__()
         self.learning_rate = learning_rate
         self.tokens = 0
@@ -196,21 +347,24 @@ class LearningRateDecayCallback(pl.Callback):
         self.lr_decay = lr_decay
         self.warmup_tokens = warmup_tokens
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(
+            self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx
+    ):
         optimizer = trainer.optimizers[0]
         _, y = batch
 
         if self.lr_decay:
-            self.tokens += (y >= 0).sum()  # number of tokens processed this step (i.e. label is not -100)
+            self.tokens += (
+                    y >= 0
+            ).sum()  # number of tokens processed this step (i.e. label is not -100)
+
             if self.tokens < self.warmup_tokens:
                 # linear warmup
                 lr_mult = float(self.tokens) / float(max(1, self.warmup_tokens))
             else:
-                # cosine learning rate decay
-                progress = float(self.tokens - self.warmup_tokens) / float(
-                    max(1, self.final_tokens - self.warmup_tokens)
-                )
-                lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+                # linear learning rate decay
+                lr_mult = 1 - 0.9 * min(1, float(self.tokens - self.warmup_tokens) / float(
+                    max(1, self.final_tokens - self.warmup_tokens)))
             lr = self.learning_rate * lr_mult
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
@@ -219,8 +373,11 @@ class LearningRateDecayCallback(pl.Callback):
 
 
 class CharDataset(Dataset):
-    def __init__(self, data, block_size):
-        chars = sorted(set(data))
+    def __init__(self, data, block_size, chars=None):
+        if chars is None:
+            chars = sorted(set(data))
+
+        self.chars = chars
         data_size, vocab_size = len(data), len(chars)
         rank_zero_info("data has %d characters, %d unique." % (data_size, vocab_size))
 
@@ -251,69 +408,32 @@ class CharDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.full_dataset = CharDataset(text, block_size)
-        train_size = int(0.8 * len(self.full_dataset))
-        val_size = len(self.full_dataset) - train_size
-        train_dataset, val_dataset = torch.utils.data.random_split(self.full_dataset, [train_size, val_size])
-
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
+        train_size = int(0.8 * len(text))
+        self.train_dataset = CharDataset(text[:train_size], block_size)
+        self.val_dataset = CharDataset(
+            text[train_size:], block_size, chars=self.train_dataset.chars
+        )
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+        )
 
     @property
     def vocab_size(self) -> int:
-        return self.full_dataset.vocab_size
+        return self.train_dataset.vocab_size
 
     @property
     def block_size(self) -> int:
-        return self.full_dataset.block_size
-
-
-class HiveMindCallback(Callback):
-    def __init__(self, hm_target_group_size: int, dht: hivemind.DHT):
-        super().__init__()
-        self.dht = dht
-        self.target_group_size = hm_target_group_size
-
-    def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
-        if len(trainer.optimizers) > 1:
-            raise MisconfigurationException("Hivemind only supports training with one optimizer.")
-        (optimizer,) = trainer.optimizers
-        # Set up a decentralized optimizer that will average with peers in background
-        opt = hivemind.optim.DecentralizedOptimizer(
-            opt=optimizer,
-            dht=self.dht,
-            prefix="lightning_run",
-            compression=hivemind.Float16Compression(),
-            average_parameters=True,
-            average_gradients=False,
-            client_mode=False,
-            verbose=True,
-            target_group_size=self.target_group_size
-        )
-        # opt.averager.load_state_from_peers()
-        trainer.optimizers = [WrapperOptimizer(opt)]
-
-    def on_train_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
-        logging.getLogger("pytorch_lightning").info("Shutting down hivemind DHT.")
-        self.dht.shutdown()
-
-
-class WrapperOptimizer:
-    def __init__(self, opt: hivemind.DecentralizedOptimizerBase):
-        self.__dict__ = {k: v for k, v in opt.__dict__.items() if k not in ("step",)}
-        self.__class__ = type("Lightning" + opt.__class__.__name__, (self.__class__, opt.__class__), {})
-        self.opt = opt
-
-    def step(self, closure=None):
-        if closure:
-            closure()
-        return self.opt.step()
+        return self.train_dataset.block_size
 
 
 if __name__ == "__main__":
@@ -321,65 +441,66 @@ if __name__ == "__main__":
 
     parser = ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
-    parser.add_argument("--n_layer", default=8, type=int)
+    parser.add_argument("--n_layer", default=4, type=int)
     parser.add_argument("--n_head", default=8, type=int)
     parser.add_argument("--n_embd", default=512, type=int)
-    parser.add_argument("--learning_rate", default=6e-4, type=float)
+    parser.add_argument("--learning_rate", default=1e-3, type=float)
     parser.add_argument("--block_size", default=128, type=int)
-    parser.add_argument("--batch_size", default=512, type=int)
+    parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--num_workers", default=0, type=int)
     args = parser.parse_args()
 
     if not os.path.exists("input.txt"):
-        os.system("wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
+        os.system(
+            "wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        )
 
     # you can download this file at https://github.com/karpathy/char-rnn/blob/master/data/tinyshakespeare/input.txt
     text = open("input.txt").read()  # don't worry we won't run out of file handles
 
     dm = CharDataModule(text, args.batch_size, args.block_size)
     model = GPT(
-        vocab_size=dm.full_dataset.vocab_size,
-        block_size=dm.full_dataset.block_size,
+        vocab_size=dm.train_dataset.vocab_size,
+        block_size=dm.train_dataset.block_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
         learning_rate=args.learning_rate,
     )
 
+    final_tokens = 20 * (len(dm.train_dataset) // target_size) * args.block_size
+
     lr_decay = LearningRateDecayCallback(
-        learning_rate=6e-4 * target_size,
-        warmup_tokens=512 * 20,
-        final_tokens=2 * len(dm.train_dataset) * args.block_size,
+        learning_rate=args.learning_rate,  ##6e-4 * target_size,
+        warmup_tokens=375e6,  # 512 * 20,
+        final_tokens=final_tokens,
     )
 
 
     class TimeCallback(Callback):
-        def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        def on_train_start(
+                self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
+        ) -> None:
             self.start = time.time()
 
-        def on_train_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        def on_train_end(
+                self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
+        ) -> None:
             rank_zero_info(f"Time till convergence: {(time.time() - self.start):.2f}")
 
 
-    initial_peers = os.environ["INITIAL_PEERS"].split(",")
-
-    dht = hivemind.DHT(
-        start=True,
-        initial_peers=initial_peers,
-    )
-
     trainer = pl.Trainer(
-        gpus=1,
+        gpus=target_size,
         log_every_n_steps=1,
+        strategy='ddp',
         max_epochs=10,
         precision=16,
         gradient_clip_val=1,
+        accumulate_grad_batches=4,
         callbacks=[
-            HiveMindCallback(hm_target_group_size=target_size, dht=dht),
             lr_decay,
             TimeCallback(),
         ],
-        val_check_interval=0.25,
     )
 
     trainer.fit(model, datamodule=dm)
