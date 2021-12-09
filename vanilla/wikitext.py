@@ -11,6 +11,7 @@ import torch.nn as nn
 import torchmetrics
 from datasets import load_dataset
 from pytorch_lightning import Callback
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.utilities import rank_zero_info
 from torch import Tensor
 from torch.nn import functional as F
@@ -507,17 +508,23 @@ if __name__ == "__main__":
     )
 
 
-    class TimeCallback(Callback):
+    class ConvergenceCallback(Callback):
+
+        def __init__(self, threshold: float, monitor: str):
+            self.threshold = threshold
+            self.monitor = monitor
+            self.logged = False
+
         def on_train_start(
                 self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
         ) -> None:
             self.start = time.time()
 
-        def on_train_end(
-                self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
-        ) -> None:
-            rank_zero_info(f"Time till convergence: {(time.time() - self.start):.2f}")
-
+        def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+            loss = trainer.callback_metrics[self.monitor]
+            if (loss <= self.threshold) and not self.logged:
+                trainer.logger.log_metrics({"Time till loss reached": time.time() - self.start})
+                self.logged = True
 
     trainer = pl.Trainer(
         gpus=args.gpus,
@@ -529,8 +536,11 @@ if __name__ == "__main__":
         accumulate_grad_batches=int(args.target_batch_size / (args.batch_size * args.gpus)),
         callbacks=[
             lr_decay,
-            TimeCallback(),
+            ConvergenceCallback(threshold=4, monitor='valid_loss'),
         ],
+        # logger=WandbLogger(
+        #     project="swarm",
+        # ),
         enable_checkpointing=False
     )
 

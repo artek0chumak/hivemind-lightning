@@ -26,4 +26,4 @@ async def get_dht(training_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run("coordinator:app", host="0.0.0.0", port=1339, log_level="debug")
+    uvicorn.run("coordinator:app", host="0.0.0.0", port=8000, log_level="debug")

@@ -84,12 +84,15 @@ def main() -> None:
 
     num_clients = args.num_local_clients
 
+    os.environ["WORLD_SIZE"] = str(num_clients)
+
     client_procs = []
     for client_rank in range(num_clients):
         env_copy = os.environ.copy()
         if num_gpus > 0:
             # choose single GPU device rank in round robin fashion
             env_copy["CUDA_VISIBLE_DEVICES"] = str(client_rank % num_gpus)
+        env_copy["HIVEMIND_RANK"] = str(client_rank)
         command = [sys.executable] + [args.training_script] + args.training_script_args
         print("STARTING PROC", command, client_rank)
         if client_rank != 0:

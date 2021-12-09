@@ -14,11 +14,12 @@ import torch.nn as nn
 import torchmetrics
 from datasets import load_dataset
 from pytorch_lightning import Callback
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.utilities import rank_zero_info
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from torch import Tensor
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchmetrics import Accuracy
 from transformers import AutoTokenizer
 
@@ -344,6 +345,11 @@ class GPT(pl.LightningModule):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         self.log("train_loss", loss.mean())
         self.log("train_ppl", self.train_ppl(logits, targets))
+
+        optimizer: hivemind.Optimizer = trainer.optimizers[0]
+        for param_group in optimizer.param_groups:
+            self.log("lr_scheduler", param_group["lr"], on_step=True)
+        self.log("local_epoch", optimizer.local_epoch, on_step=True)
         return loss
 
     def validation_step(self, batch, _):
@@ -430,11 +436,29 @@ class CharDataModule(pl.LightningDataModule):
         self.train_dataset = CharDataset(self.dataset["train"], self.tokenizer, block_size)
         self.val_dataset = CharDataset(self.dataset["validation"], self.tokenizer, block_size)
 
+    def sampler(self, dataset, shuffle):
+        return DistributedSampler(
+            dataset=dataset,
+            num_replicas=int(os.environ["WORLD_SIZE"]),
+            rank=int(os.environ["HIVEMIND_RANK"]),
+            shuffle=shuffle
+        )
+
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            sampler=self.sampler(self.train_dataset, shuffle=True)
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            sampler=self.sampler(self.val_dataset, shuffle=False)
+        )
 
     @property
     def vocab_size(self) -> int:
@@ -482,7 +506,7 @@ class HiveMindCallback(Callback):
         return dict(
             matchmaking_time=5.0,
             averaging_timeout=30.0,
-            delay_optimizer_step=True,
+            delay_optimizer_step=False,
             grad_compression=hivemind.Float16Compression(),
             state_averaging_compression=hivemind.Float16Compression(),
             averager_opts=dict(request_timeout=1.0),
@@ -502,7 +526,7 @@ class HiveMindCallback(Callback):
             scheduler=partial(DummyLearningRateScheduler, num_warmup_steps=self.num_warmup_steps,
                               num_training_steps=self.num_training_steps),
             target_batch_size=self.target_batch_size,
-            batch_size_per_step=self.batch_size,
+            batch_size_per_step=self.batch_size * 4,
             **self.optimizer_kwargs
         )
         opt.load_state_from_peers()
@@ -526,7 +550,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_batch_size", default=16384, type=int)
     parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--num_workers", default=0, type=int)
-    parser.add_argument("--gpus", default=8, type=int)
+    parser.add_argument("--gpus", default=1, type=int)
     parser.add_argument("--max_epochs", default=20, type=int)
     args = parser.parse_args()
 
@@ -549,16 +573,23 @@ if __name__ == "__main__":
     )
 
 
-    class TimeCallback(Callback):
+    class ConvergenceCallback(Callback):
+
+        def __init__(self, threshold: float, monitor: str):
+            self.threshold = threshold
+            self.monitor = monitor
+            self.logged = False
+
         def on_train_start(
                 self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
         ) -> None:
             self.start = time.time()
 
-        def on_train_end(
-                self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"
-        ) -> None:
-            rank_zero_info(f"Time till convergence: {(time.time() - self.start):.2f}")
+        def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+            loss = trainer.callback_metrics[self.monitor]
+            if (loss <= self.threshold) and not self.logged:
+                trainer.logger.log_metrics({"Time till loss reached": time.time() - self.start})
+                self.logged = True
 
 
     initial_peers = os.environ["INITIAL_PEERS"].split(",")
@@ -572,12 +603,12 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         gpus=args.gpus,
         log_every_n_steps=1,
-        strategy='ddp',
         max_epochs=args.max_epochs,
         precision=16,
         gradient_clip_val=1,
+        accumulate_grad_batches=4,
         callbacks=[
-            TimeCallback(),
+            ConvergenceCallback(threshold=4, monitor='valid_loss'),
             HiveMindCallback(
                 target_batch_size=args.target_batch_size,
                 batch_size=args.batch_size,
@@ -586,6 +617,11 @@ if __name__ == "__main__":
                 dht=dht
             ),
         ],
+        # logger=WandbLogger(
+        #     project="swarm",
+        #     name=f"hivemind_2_rank{(os.environ['HIVEMIND_RANK'])}"
+        # ),
+        replace_sampler_ddp=False,
         enable_checkpointing=False
     )
 
