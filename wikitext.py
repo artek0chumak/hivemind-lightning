@@ -69,7 +69,7 @@ def lamb_step(
 class LAMB(torch.optim.Optimizer):
     r"""Implements LAMB algorithm. Based on PyTorch's Adam"""
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, clip_max_norm=None):
         betas = float(betas[0]), float(betas[1])
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -87,6 +87,7 @@ class LAMB(torch.optim.Optimizer):
             eps=eps,
             weight_decay=weight_decay,
         )
+        self.clip_max_norm = clip_max_norm
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -101,6 +102,10 @@ class LAMB(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+                
+        if self.clip_max_norm is not None:
+            iter_params = (param for group in self.param_groups for param in group['params'])
+            torch.nn.utils.clip_grad_norm_(iter_params, self.clip_max_norm)
 
         for group in self.param_groups:
             params_with_grad = []
@@ -316,7 +321,7 @@ class GPT(pl.LightningModule):
             {"params": params_nodecay, "weight_decay": 0.0},
         ]
         return LAMB(
-            optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas
+            optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas, clip_max_norm=1.0
         )
 
     def forward(self, idx):
@@ -552,7 +557,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", default=0, type=int)
     parser.add_argument("--gpus", default=1, type=int)
     parser.add_argument("--max_epochs", default=20, type=int)
+    parser.add_argument("--seed", default=1337, type=int)
     args = parser.parse_args()
+    
+    torch.manual_seed(args.seed)
 
     if not os.path.exists("input.txt"):
         os.system(
@@ -605,7 +613,7 @@ if __name__ == "__main__":
         log_every_n_steps=1,
         max_epochs=args.max_epochs,
         precision=16,
-        gradient_clip_val=1,
+        gradient_clip_val=99999999999999999999999999,
         accumulate_grad_batches=4,
         callbacks=[
             ConvergenceCallback(threshold=4, monitor='valid_loss'),
@@ -617,10 +625,10 @@ if __name__ == "__main__":
                 dht=dht
             ),
         ],
-        # logger=WandbLogger(
-        #     project="swarm",
-        #     name=f"hivemind_2_rank{(os.environ['HIVEMIND_RANK'])}"
-        # ),
+        logger=WandbLogger(
+            project="swarm",
+            name=f"hivemind_2_rank{(os.environ['HIVEMIND_RANK'])}"
+        ),
         replace_sampler_ddp=False,
         enable_checkpointing=False
     )
