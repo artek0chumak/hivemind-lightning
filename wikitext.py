@@ -557,10 +557,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", default=0, type=int)
     parser.add_argument("--gpus", default=1, type=int)
     parser.add_argument("--max_epochs", default=20, type=int)
-    parser.add_argument("--seed", default=1337, type=int)
     args = parser.parse_args()
     
-    torch.manual_seed(args.seed)
 
     if not os.path.exists("input.txt"):
         os.system(
@@ -625,10 +623,10 @@ if __name__ == "__main__":
                 dht=dht
             ),
         ],
-        logger=WandbLogger(
-            project="swarm",
-            name=f"hivemind_2_rank{(os.environ['HIVEMIND_RANK'])}"
-        ),
+        # logger=WandbLogger(
+        #     project="swarm",
+        #     name=f"hivemind_2_rank{(os.environ['HIVEMIND_RANK'])}"
+        # ),
         replace_sampler_ddp=False,
         enable_checkpointing=False
     )
