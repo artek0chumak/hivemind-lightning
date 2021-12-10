@@ -611,7 +611,6 @@ if __name__ == "__main__":
         log_every_n_steps=1,
         max_epochs=args.max_epochs,
         precision=16,
-        gradient_clip_val=99999999999999999999999999,
         accumulate_grad_batches=4,
         callbacks=[
             ConvergenceCallback(threshold=4, monitor='valid_loss'),
