@@ -1,6 +1,6 @@
 uvicorn
 pytorch-lightning
 fastapi
-git+https://github.com/learning-at-home/hivemind.git
+git+https://github.com/artek0chumak/hivemind.git@power_ef_new
 transformers
 datasets

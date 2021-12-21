@@ -503,6 +503,8 @@ class HiveMindCallback(Callback):
                               num_training_steps=self.num_training_steps),
             target_batch_size=self.target_batch_size,
             batch_size_per_step=self.batch_size,
+            grad_rank_averager="power_ef",
+            grad_averager_opts={"averager_rank": 1}
             **self.optimizer_kwargs
         )
         opt.load_state_from_peers()
