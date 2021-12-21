@@ -485,7 +485,7 @@ class HiveMindCallback(Callback):
             delay_optimizer_step=True,
             grad_compression=hivemind.Float16Compression(),
             state_averaging_compression=hivemind.Float16Compression(),
-            averager_opts=dict(request_timeout=1.0),
+            averager_opts=dict(request_timeout=1.0, ),
             verbose=True,
         )
 
@@ -504,7 +504,7 @@ class HiveMindCallback(Callback):
             target_batch_size=self.target_batch_size,
             batch_size_per_step=self.batch_size,
             grad_rank_averager="power_ef",
-            grad_averager_opts={"averager_rank": 1}
+            grad_averager_opts={"averager_rank": 1},
             **self.optimizer_kwargs
         )
         opt.load_state_from_peers()
